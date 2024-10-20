@@ -1,66 +1,28 @@
-import inspect
-import os
 from contextlib import ExitStack
-from typing import Type, Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Type, Any, Optional, Callable
 
 import torch
-import torchvision
-import torchvision.transforms as T
-from diffusers.configuration_utils import ConfigMixin
-from diffusers.models.adapter import T2IAdapter
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
-from diffusers.schedulers.scheduling_dpmsolver_sde import DPMSolverSDEScheduler
-from diffusers.schedulers.scheduling_tcd import TCDScheduler
-from diffusers.schedulers.scheduling_utils import SchedulerMixin as Scheduler
-from pydantic import field_validator
-from torchvision.transforms.functional import resize as tv_resize
-from transformers import CLIPVisionModelWithProjection
 
-from invokeai.app.invocations.baseinvocation import BaseInvocation, invocation, invocation_output, BaseInvocationOutput
-from invokeai.app.invocations.constants import LATENT_SCALE_FACTOR
-from invokeai.app.invocations.controlnet_image_processors import ControlField
-from invokeai.app.invocations.fields import (
-    ConditioningField,
-    DenoiseMaskField,
-    FieldDescriptions,
+from invokeai.invocation_api import (
+    invocation,
+    invocation_output,
+    BaseInvocationOutput,
     Input,
     InputField,
-    LatentsField,
-    UIType,
     OutputField,
-    Field,
+    LatentsOutput,
+    InvocationContext
 )
-from invokeai.app.invocations.ip_adapter import IPAdapterField
-from invokeai.app.invocations.model import ModelIdentifierField, UNetField
-from invokeai.app.invocations.primitives import LatentsOutput
-from invokeai.app.invocations.t2i_adapter import T2IAdapterField
-from invokeai.app.services.shared.invocation_context import InvocationContext
-from invokeai.app.util.controlnet_utils import prepare_control_image
-from invokeai.backend.ip_adapter.ip_adapter import IPAdapter
-from invokeai.backend.lora.lora_model_raw import LoRAModelRaw
-from invokeai.backend.lora.lora_patcher import LoRAPatcher
-from invokeai.backend.model_manager import BaseModelType, ModelVariantType
+from invokeai.app.invocations.fields import Field
+from invokeai.backend.model_manager import ModelVariantType
 from invokeai.backend.model_patcher import ModelPatcher
 from invokeai.backend.stable_diffusion import PipelineIntermediateState
 from invokeai.backend.stable_diffusion.denoise_context import DenoiseContext, DenoiseInputs
-from invokeai.backend.stable_diffusion.diffusers_pipeline import (
-    ControlNetData,
-    StableDiffusionGeneratorPipeline,
-    T2IAdapterData,
-)
-from invokeai.backend.stable_diffusion.diffusion.conditioning_data import (
-    BasicConditioningInfo,
-    IPAdapterConditioningInfo,
-    IPAdapterData,
-    Range,
-    SDXLConditioningInfo,
-    TextConditioningData,
-    TextConditioningRegions,
-)
+
 from invokeai.backend.stable_diffusion.diffusion.custom_atttention import CustomAttnProcessor2_0
 from invokeai.backend.stable_diffusion.diffusion_backend import StableDiffusionBackend
 from invokeai.backend.stable_diffusion.extension_callback_type import ExtensionCallbackType
-from invokeai.backend.stable_diffusion.extensions.controlnet import ControlNetExt
 from invokeai.backend.stable_diffusion.extensions.freeu import FreeUExt
 from invokeai.backend.stable_diffusion.extensions.inpaint import InpaintExt
 from invokeai.backend.stable_diffusion.extensions.inpaint_model import InpaintModelExt
@@ -73,15 +35,13 @@ from invokeai.backend.stable_diffusion.extensions_manager import ExtensionsManag
 from invokeai.backend.stable_diffusion.schedulers import SCHEDULER_MAP
 from invokeai.backend.stable_diffusion.schedulers.schedulers import SCHEDULER_NAME_VALUES
 from invokeai.backend.util.devices import TorchDevice
-from invokeai.backend.util.hotfixes import ControlNetModel
-from invokeai.backend.util.mask import to_standard_float_mask
 from invokeai.backend.util.silence_warnings import SilenceWarnings
 
 
 # imports purely for local implementation
 from invokeai.app.invocations.denoise_latents import DenoiseLatentsInvocation
 from invokeai.app.invocations.denoise_latents import get_scheduler
-from invokeai.backend.stable_diffusion.extensions.base import ExtensionBase
+from invokeai.backend.stable_diffusion.extensions.base import ExtensionBase, callback
 from invokeai.backend.util.logging import info, warning, error
 from pydantic import BaseModel
 
@@ -100,7 +60,7 @@ def base_guidance_extension(name: str):
 class GuidanceField(BaseModel):
     """Guidance information for extensions in the denoising process."""
     guidance_name: str = Field(description="The name of the guidance extension class")
-    priority: int = Field(default=100, description="Execution order for multiple guidance. Lower numbers go first.")
+    #priority: int = Field(default=100, description="Execution order for multiple guidance. Lower numbers go first.")
     extension_kwargs: dict[str, Any] = Field(default={}, description="Keyword arguments for the guidance extension")
 
 @invocation_output("guidance_module_output")
@@ -109,6 +69,25 @@ class GuidanceDataOutput(BaseInvocationOutput):
         title="Guidance Module",
         description="Information to alter the denoising process"
     )
+
+#Current one in main is broken, so use this for now
+class PreviewExtFIX(PreviewExt):
+    def __init__(self, callback: Callable[[PipelineIntermediateState], None]):
+        super().__init__(callback=callback)
+
+    # do last so that all other changes shown
+    @callback(ExtensionCallbackType.PRE_DENOISE_LOOP, order=1000)
+    def initial_preview(self, ctx: DenoiseContext):
+        self.callback(
+            PipelineIntermediateState(
+                step=0, #-1 in main causes an error
+                order=ctx.scheduler.order,
+                total_steps=len(ctx.inputs.timesteps),
+                timestep=int(ctx.scheduler.config.num_train_timesteps),  # TODO: is there any code which uses it?
+                latents=ctx.latents,
+            )
+        )
+
 
 @invocation(
     "exposed_denoise_latents",
@@ -168,6 +147,16 @@ class ExposedDenoiseLatentsInvocation(DenoiseLatentsInvocation):
             denoising_end=self.denoising_end,
         )
 
+        # user extensions
+        if self.guidance_module:
+            guidance = self.guidance_module
+            if guidance.guidance_name in SD12X_EXTENSIONS:
+                ext_cls = SD12X_EXTENSIONS[guidance.guidance_name]
+                ext = ext_cls(**guidance.extension_kwargs)
+                ext_manager.add_extension(ext)
+            else:
+                raise ValueError(f"Extension {guidance.guidance_name} not found")
+
         # get the unet's config so that we can pass the base to sd_step_callback()
         unet_config = context.models.get_config(self.unet.unet.key)
 
@@ -175,7 +164,7 @@ class ExposedDenoiseLatentsInvocation(DenoiseLatentsInvocation):
         def step_callback(state: PipelineIntermediateState) -> None:
             context.util.sd_step_callback(state, unet_config.base)
 
-        ext_manager.add_extension(PreviewExt(step_callback))
+        ext_manager.add_extension(PreviewExtFIX(step_callback))
 
         ### cfg rescale
         if self.cfg_rescale_multiplier > 0:
